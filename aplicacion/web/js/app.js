@@ -344,6 +344,18 @@ const app = {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   },
 
+  preloadActivityOnHover(actId) {
+    if (!window.api || !api.preloadActivityAudios) return;
+    const allLists = [
+      ...(window.mockData?.studentActivities || []),
+      ...(window.mockData?.sofiaActivities || [])
+    ];
+    const act = allLists.find(a => a.id === actId);
+    if (act) {
+      api.preloadActivityAudios(act);
+    }
+  },
+
   async openVoiceModal(activityTitle = 'Misión Conteo Mágico: Cuenta del 1 al 10 con Robot Leo', activityId = 'act-conteo') {
     this.voiceModalContextTitle = activityTitle;
     this.activeActivityId = activityId || 'act-conteo';
@@ -358,7 +370,9 @@ const app = {
       this.activeActivityType = 'counting';
     }
 
-    this.voiceNoiseDisclaimerAccepted = false;
+    // Comprobar si las recomendaciones de ruido ya fueron aceptadas en esta sesion
+    const hasSeenDisclaimer = sessionStorage.getItem('educonnect_noise_disclaimer_accepted') === 'true';
+    this.voiceNoiseDisclaimerAccepted = hasSeenDisclaimer;
     this.voiceModalStage = 'loading';
     this.countedNumbers = [];
     this.currentQuestionIndex = 0;
@@ -372,34 +386,44 @@ const app = {
     const loadingStatus = document.getElementById('counting-loading-status');
 
     try {
-      if (loadingBar) loadingBar.style.width = '65%';
-      if (loadingStatus) loadingStatus.textContent = 'Sincronizando voz de Robot Leo y preparando indicaciones...';
+      if (loadingBar) loadingBar.style.width = '75%';
+      if (loadingStatus) loadingStatus.textContent = 'Sincronizando voz de Robot Leo y preparando actividad...';
 
       const apiClient = window.api || (typeof api !== 'undefined' ? api : null);
-      const preloadPromises = [new Promise(r => setTimeout(r, 550))];
 
       if (apiClient) {
-        preloadPromises.push(apiClient.checkHealth().catch(() => {}));
-        if (apiClient.preloadTtsAudio) {
-          preloadPromises.push(apiClient.preloadTtsAudio(this.disclaimerAndInstructionsTtsText).catch(() => {}));
+        const loadTasks = [apiClient.checkHealth().catch(() => {})];
+        if (apiClient.preloadActivityAudios && act) {
+          loadTasks.push(apiClient.preloadActivityAudios(act));
+        } else if (apiClient.preloadTtsAudio) {
+          loadTasks.push(apiClient.preloadTtsAudio(this.disclaimerAndInstructionsTtsText).catch(() => {}));
           const firstPrompt = this.getCurrentStepSpeechText();
           if (firstPrompt) {
-            preloadPromises.push(apiClient.preloadTtsAudio(firstPrompt).catch(() => {}));
+            loadTasks.push(apiClient.preloadTtsAudio(firstPrompt).catch(() => {}));
           }
         }
+        await Promise.all(loadTasks);
       }
-
-      await Promise.all(preloadPromises);
 
       if (!this.isVoiceModalOpen) return;
       if (loadingBar) loadingBar.style.width = '100%';
-      await new Promise(r => setTimeout(r, 150));
     } catch (err) {
       console.warn("[Modal] Aviso en precarga:", err);
     }
 
     if (!this.isVoiceModalOpen) return;
-    this.setModalStage('welcome');
+
+    // Si ya vio y acepto las recomendaciones de ruido en la sesion actual, entrar directo a la actividad
+    if (this.voiceNoiseDisclaimerAccepted) {
+      this.setModalStage('activity');
+      if (act && act.activityType === 'story_comprehension' && this.currentQuestionIndex === 0) {
+        await this.speakStoryAndCurrentQuestion();
+      } else if (act && (act.activityType === 'addition' || act.activityType === 'phonological')) {
+        await this.speakCurrentActivityPrompt();
+      }
+    } else {
+      this.setModalStage('welcome');
+    }
   },
 
   setModalStage(stage) {
@@ -457,6 +481,9 @@ const app = {
       apiClient.stopSpeaking();
     }
     this.voiceNoiseDisclaimerAccepted = true;
+    try {
+      sessionStorage.setItem('educonnect_noise_disclaimer_accepted', 'true');
+    } catch (e) {}
     this.setModalStage('activity');
 
     // Al entrar a las actividades de preguntas o relato, leer automaticamente el primer desafio
@@ -1195,7 +1222,12 @@ const app = {
         if (btnText) btnText.textContent = 'Detener y Enviar (Espacio)';
       }
 
-      const startRes = await apiClient.startVoiceRecording();
+      const startRes = await apiClient.startVoiceRecording(() => {
+        // Detección automática de silencio continuo tras haber hablado (Auto-Stop VAD)
+        if (this.isRecordingVoice && !this._isBusyTranscribing) {
+          this.toggleVoiceRecording();
+        }
+      });
       if (!startRes.success) {
         this.isRecordingVoice = false;
         if (btn) {
